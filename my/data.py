@@ -208,8 +208,7 @@ def data_process(args):
                         entity_target=entity_target,
                         entity_start=entity_start,
                         entity_end=entity_end,
-                        relations=np.asarray(relations),
-                        total_sample=args.total_sample - entity_num))
+                        relations=np.asarray(relations)))
     with open(args.data_path, 'wb') as f:
         pickle.dump(res, f)
     print('可能不匹配的实体数量： ', len(not_same_entity))

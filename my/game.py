@@ -24,7 +24,6 @@ class PlModel(pl.LightningModule):
         self.total_step = total_step
         self.RE_model = ReModel(args)
         self.loss_list = []
-        self.ner_f1 = []
         pl_logger = logging.getLogger('pytorch_lightning')
         pl_logger.addHandler(logging.FileHandler(args.save_name + '.txt'))
         self.save_hyperparameters(logger=True)
@@ -46,13 +45,10 @@ class PlModel(pl.LightningModule):
                                  "interval": 'step'}}
 
     def training_step(self, batch, batch_idx):
-        ner_loss, ner_seq = self.RE_model(batch)
+        ner_loss, ner_result, re_result = self.RE_model(batch)
         self.loss_list.append(float(ner_loss))
-        # self.ner_f1.append(compute_score(ner_seq, batch))
 
         cur_loss = round(sum(self.loss_list) / len(self.loss_list), 5)
-        # cur_f1 = round(sum(x[0] for x in self.ner_f1) / len(self.ner_f1), 5)
-        # log_info = dict(loss=cur_loss, f1=cur_f1)
         log_info = dict(loss=cur_loss)
         self.log_dict(log_info)
 
@@ -63,8 +59,8 @@ class PlModel(pl.LightningModule):
         self.ner_f1.clear()
 
     def validation_step(self, batch, batch_idx):
-        ner_loss, ner_seq = self.RE_model(batch, is_test=True)
-        f1_recall_precision = compute_score(ner_seq, batch)
+        ner_loss, ner_result, re_result = self.RE_model(batch, is_test=True)
+        f1_recall_precision = compute_score(ner_result, batch)
         return f1_recall_precision
 
     def validation_epoch_end(self, validation_step_outputs):
@@ -128,7 +124,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--batch_size", type=int, default=2)
     parser.add_argument("--bert_lr", type=float, default=1e-5)
-    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--warm_ratio", type=float, default=0.06)
     parser.add_argument("--bert_path", type=str, default="hfl/chinese-roberta-wwm-ext")
     parser.add_argument("--new_token_num", type=int, default=0)
@@ -136,11 +132,8 @@ if __name__ == "__main__":
     parser.add_argument("--print_log", action='store_true')
 
     parser.add_argument("--max_len", type=int, default=1024)
-    parser.add_argument("--span", type=int, default=20)
-    parser.add_argument("--total_sample", type=int, default=1024)
     parser.add_argument("--tag_size", type=int, default=6)
-    parser.add_argument("--ner_dropout", type=float, default=0.1)
-    parser.add_argument("--ner_emb_dim", type=int, default=150)
+    parser.add_argument("--relation_num", type=int, default=5)
 
     parser.add_argument("--raw_data_path", type=str, default='../BDCI_data/train.json')
     parser.add_argument("--data_path", type=str, default='data/raw.bin')

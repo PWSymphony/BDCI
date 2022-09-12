@@ -1,4 +1,5 @@
 import argparse
+from itertools import permutations
 
 import numpy as np
 import torch
@@ -191,11 +192,11 @@ class NER(nn.Module):
                 entity.append(hidden_state[i][x])
             entity = pad_sequence(entity, batch_first=True)
 
-        q = self.q_fc(entity)
+        q = torch.tanh(self.q_fc(entity))
         q = q.reshape(q.shape[0], q.shape[1], self.heads, -1)
         q = q.permute(0, 2, 1, 3)
 
-        k = self.k_fc(hidden_state)
+        k = torch.tanh(self.k_fc(hidden_state))
         k = k.reshape(k.shape[0], k.shape[1], self.heads, -1)
         k = k.permute(0, 2, 3, 1)
 
@@ -211,7 +212,7 @@ class NER(nn.Module):
         else:
             loss1 = self.loss_fn(start_logit, entity_target, attention_mask)
             loss2 = self.loss_fn(end_logit, entity_end, batch['entity_mask'])
-            loss = (loss1 + loss2) / 2
+            loss = loss1 + loss2
             entity_start_index = batch['entity_start']
 
             entity_end_index = [entity_end[i, :entity_num[i]] for i in range(hidden_state.shape[0])]
@@ -257,6 +258,48 @@ class NER(nn.Module):
 #         else:
 #             return None, self.loss_fn.get_label(entity_feature)
 
+class ExtraRelation(nn.Module):
+    def __init__(self, hidden_size, args: argparse.Namespace):
+        super(ExtraRelation, self).__init__()
+        self.h_dense = nn.Linear(hidden_size * 2, 256)
+        self.t_dense = nn.Linear(hidden_size * 2, 256)
+        self.cls = nn.Bilinear(256, 256, args.relation_num)
+
+        self.loss_fn = CELoss()
+
+    def forward(self, hidden_state, attention, ner_result, batch, is_test=False):
+        batch_size = hidden_state.shape[0]
+        attention = attention.mean(dim=1)
+        entity_num = batch['entity_mask'].sum(-1).tolist()
+        head, tail = ner_result
+
+        all_h, all_t = [], []
+        for i in range(batch_size):
+            entity_feature = (hidden_state[i][head[i]] + hidden_state[i][tail[i]]) * 0.5
+            entity_attention = (attention[i][head[i]] + attention[i][tail[i]]) * 0.5
+
+            hts = torch.tensor(list(permutations(range(entity_num[i]), 2)),
+                               dtype=torch.int64, device=attention.device)
+            h, t = hts[:, 0], hts[:, 1]
+            head_feature, tail_feature = entity_feature[h], entity_feature[t]
+            ht_attention = entity_attention[h] * entity_attention[t] * batch['attention_mask'][i]
+            ht_attention = ht_attention / ht_attention.sum(-1).unsqueeze(-1)
+            ht_info = ht_attention @ hidden_state[i]
+
+            all_h.append(torch.cat((head_feature, ht_info), dim=-1))
+            all_t.append(torch.cat((tail_feature, ht_info), dim=-1))
+
+        all_h = torch.tanh(self.h_dense(pad_sequence(all_h, batch_first=True)))
+        all_t = torch.tanh(self.t_dense(pad_sequence(all_t, batch_first=True)))
+        pred = self.cls(all_h, all_t)
+
+        mask = torch.zeros_like(batch['relations'], device=hidden_state.device, dtype=torch.bool)
+        for i in range(batch_size):
+            mask[i, :(entity_num[i] * (entity_num[i] - 1))] = True
+        loss = self.loss_fn(pred, batch['relations'], mask)
+
+        return loss, pred.max(-1)[1]
+
 
 class ReModel(nn.Module):
     def __init__(self, args: argparse.Namespace):
@@ -265,11 +308,15 @@ class ReModel(nn.Module):
         self.bert.resize_token_embeddings(args.new_token_num)
         bert_hidden_size = self.bert.config.hidden_size
         self.ner_model = NER(bert_hidden_size, args)
+        self.extra_relation = ExtraRelation(bert_hidden_size, args)
 
     def forward(self, batch, is_test=False):
         input_id = batch['input_id']
         attention_mask = batch['attention_mask']
-        hidden_state, attention = process_long_input(self.bert, input_id, attention_mask, [101], [102])
-        ner_loss, ner_seq = self.ner_model(hidden_state, batch, is_test)
 
-        return ner_loss, ner_seq
+        hidden_state, attention = process_long_input(self.bert, input_id, attention_mask, [101], [102])
+        ner_loss, ner_result = self.ner_model(hidden_state, batch, is_test)
+        re_loss, re_result = self.extra_relation(hidden_state, attention, ner_result, batch, is_test)
+
+        final_loss = ner_loss + re_loss
+        return re_loss, ner_result, re_result
