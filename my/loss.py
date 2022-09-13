@@ -83,7 +83,8 @@ class CELoss(nn.Module):
         if mask is not None:
             mask = mask.reshape(-1)
             loss = (loss * mask).sum() / mask.sum()
-
+        else:
+            loss = loss.mean()
         return loss
 
     @staticmethod

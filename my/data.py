@@ -18,6 +18,7 @@ from transformers import BertTokenizerFast, logging as transformer_log
 transformer_log.set_verbosity_error()
 warnings.filterwarnings("ignore", category=UserWarning)
 LABEL = {"部件故障": 1, "性能故障": 2, "检测工具": 3, "组成": 4}
+ID2LABEL = {v: k for k, v in LABEL.items()}
 TYPE = {"部件单元": 1, "性能表征": 2, "故障状态": 3, "检测工具": 4}
 LABEL2TYPE = {"部件故障": [TYPE["部件单元"], TYPE["故障状态"]],
               "性能故障": [TYPE["性能表征"], TYPE["故障状态"]],
@@ -143,7 +144,8 @@ def data_process(args):
     data = [json.loads(_) for _ in raw]
     all_token = set()
     for d in data:
-        all_token.update(d['text'])
+        d['text'] = d['text'].lower()
+        all_token.update(d['text'].lower())
     all_token = list(all_token)
     tokenizer = BertTokenizerFast.from_pretrained(args.bert_path)
     add_token_num = tokenizer.add_tokens(all_token)
@@ -153,14 +155,16 @@ def data_process(args):
 
     res = []
     not_same_entity = []
+    max_entity_num = 0
     for item in tqdm(data):
-        input_id = [CLS_id] + [tokenizer.convert_tokens_to_ids(i) for i in item['text']] + [SEP_id]
+        text = item['text']
+        input_id = [CLS_id] + [tokenizer.convert_tokens_to_ids(i) for i in text] + [SEP_id]
         assert len(input_id) - 2 == len(item['text']), print(item['ID'])
         if len(input_id) > args.max_len:
             sep = input_id[-1]
             input_id = input_id[:1023] + [sep]
 
-        spo_list = item['spo_list']
+        spo_list = item.get('spo_list', None)
         if not spo_list:
             continue
         spo_dict = {}
@@ -175,10 +179,10 @@ def data_process(args):
                 continue
 
             token_name = ''.join(tokenizer.convert_ids_to_tokens(input_id[h[0]: h[1]]))
-            if token_name != spo['h']['name'].strip():
+            if token_name != spo['h']['name'].strip().lower():
                 not_same_entity.append((token_name, spo['h']['name']))
             token_name = ''.join(tokenizer.convert_ids_to_tokens(input_id[t[0]: t[1]]))
-            if token_name != spo['t']['name'].strip():
+            if token_name != spo['t']['name'].strip().lower():
                 not_same_entity.append((token_name, spo['t']['name']))
 
             h.append(ht_type[0])
@@ -190,9 +194,10 @@ def data_process(args):
             spo_dict[(h, t)] = r
 
         entity = list(entity)
+        max_entity_num = max(len(entity), max_entity_num)
         entity.sort(key=lambda x: x[1])
 
-        relations = [spo_dict.get((h, t), 0) for h, t in permutations(entity, 2)]
+        relations = np.asarray([spo_dict.get((h, t), 0) for h, t in permutations(entity, 2)])
         entity_num = len(entity)
         entity_target = np.zeros((len(input_id)))
         entity_start = np.zeros((len(entity)))
@@ -208,11 +213,63 @@ def data_process(args):
                         entity_target=entity_target,
                         entity_start=entity_start,
                         entity_end=entity_end,
-                        relations=np.asarray(relations)))
+                        relations=relations))
     with open(args.data_path, 'wb') as f:
         pickle.dump(res, f)
+    process_test_data(args.raw_test_data, args.test_data_path, tokenizer, args.max_len)
     print('可能不匹配的实体数量： ', len(not_same_entity))
     print('增加的token数量： ', add_token_num)
+    print('最大实体数量', max_entity_num)
+
+
+def process_test_data(raw_path, out_path, tokenizer, max_len):
+    with open(raw_path, encoding='utf-8') as f:
+        raw = f.readlines()
+    data = [json.loads(_) for _ in raw]
+    CLS_id = tokenizer.cls_token_id
+    SEP_id = tokenizer.sep_token_id
+    res = []
+    for item in data:
+        text = item['text']
+        input_id = [CLS_id] + [tokenizer.convert_tokens_to_ids(i) for i in text] + [SEP_id]
+        assert len(input_id) - 2 == len(item['text']), print(item['ID'])
+        if len(input_id) > max_len:
+            sep = input_id[-1]
+            input_id = input_id[:1023] + [sep]
+        res.append(dict(input_id=np.asarray(input_id),
+                        ID=item['ID'],
+                        text=item['text']))
+    with open(out_path, 'wb') as f:
+        pickle.dump(res, f)
+
+
+def get_result(ner_result, re_result, batch):
+    batch_size = len(re_result)
+    result = []
+    for i in range(batch_size):
+        text = batch['text'][i]
+        start = (ner_result[0][i] - 1).tolist()
+        end = ner_result[1][i].tolist()
+        entity = [[start[j], end[j]] for j in range(len(start))]
+        relations = re_result[i].tolist()
+        k = -1
+        spo_list = []
+        for h_pos, t_pos in permutations(entity, 2):
+            k += 1
+            relation = ID2LABEL.get(relations[k], None)
+            if relation is None:
+                continue
+            h = dict(name=text[h_pos[0]: h_pos[1]],
+                     pos=h_pos)
+            t = dict(name=text[t_pos[0]: t_pos[1]],
+                     pos=t_pos)
+
+            spo_list.append(dict(h=h, t=t, relation=relation))
+
+        result.append(dict(ID=batch['ID'][i],
+                           text=text,
+                           spo_list=spo_list))
+    return result
 
 
 class Data(Dataset):
@@ -270,29 +327,38 @@ def get_sample(batch, is_test):
     return entity_heads, entity_tails, entity_labels, spans
 
 
-def get_batch(batch, is_test=False):
+def get_batch(batch):
     input_id = pad_sequence([torch.from_numpy(x["input_id"]) for x in batch], batch_first=True)
-    relations = pad_sequence([torch.from_numpy(x["relations"]) for x in batch], batch_first=True)
     attention_mask = create_mask(batch, input_id)
-    batch_size, max_len = input_id.shape
+    if 'text' not in batch[0]:
+        # relations = pad_sequence([torch.from_numpy(x["relations"]) for x in batch], batch_first=True)
+        relations = torch.cat([torch.from_numpy(x["relations"]) for x in batch], dim=-1)
+        batch_size, max_len = input_id.shape
 
-    entity_nums = [x['entity_num'] for x in batch]
-    entity_mask = torch.zeros(batch_size, max(entity_nums))
-    for i in range(batch_size):
-        entity_mask[i, :entity_nums[i]] = 1
-    # entity_heads, entity_tails, entity_labels, spans = get_sample(batch, is_test)
+        entity_nums = [x['entity_num'] for x in batch]
+        entity_mask = torch.zeros(batch_size, max(entity_nums))
+        for i in range(batch_size):
+            entity_mask[i, :entity_nums[i]] = 1
+        # entity_heads, entity_tails, entity_labels, spans = get_sample(batch, is_test)
 
-    entity_target = pad_sequence([torch.from_numpy(x['entity_target']) for x in batch], batch_first=True)
-    entity_end = pad_sequence([torch.from_numpy(x['entity_end']) for x in batch], batch_first=True)
-    entity_start = [torch.from_numpy(x['entity_start']).long() for x in batch]
+        entity_target = pad_sequence([torch.from_numpy(x['entity_target']) for x in batch], batch_first=True)
+        entity_end = pad_sequence([torch.from_numpy(x['entity_end']) for x in batch], batch_first=True)
+        entity_start = [torch.from_numpy(x['entity_start']).long() for x in batch]
 
-    return dict(input_id=input_id,
-                entity_target=entity_target.long(),
-                entity_start=entity_start,
-                entity_end=entity_end.long(),
-                attention_mask=attention_mask.bool(),
-                relations=relations.long(),
-                entity_mask=entity_mask.bool())
+        return dict(input_id=input_id,
+                    entity_target=entity_target.long(),
+                    entity_start=entity_start,
+                    entity_end=entity_end.long(),
+                    attention_mask=attention_mask.bool(),
+                    relations=relations.long(),
+                    entity_mask=entity_mask.bool())
+    else:
+        text = [x['text'] for x in batch]
+        ID = [x['ID'] for x in batch]
+        return dict(input_id=input_id,
+                    attention_mask=attention_mask,
+                    text=text,
+                    ID=ID)
 
 
 # def get_batch_single(batch):

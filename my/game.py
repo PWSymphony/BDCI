@@ -1,16 +1,18 @@
 import argparse
+import json
 import logging
 import platform
 import warnings
-from functools import partial
 
 import pytorch_lightning as pl
 import torch
+from pytorch_lightning import seed_everything
+from pytorch_lightning.callbacks import ModelCheckpoint
 from torch.utils.data import DataLoader
 from transformers import logging as transformer_log
 from transformers.optimization import get_linear_schedule_with_warmup
 
-from data import Data, get_batch, data_process, MyLogger  # , get_batch_single
+from data import Data, get_batch, data_process, MyLogger, get_result
 from model import compute_score, ReModel
 
 transformer_log.set_verbosity_error()
@@ -27,6 +29,7 @@ class PlModel(pl.LightningModule):
         pl_logger = logging.getLogger('pytorch_lightning')
         pl_logger.addHandler(logging.FileHandler(args.save_name + '.txt'))
         self.save_hyperparameters(logger=True)
+        self.save_name = args.save_name
 
     def forward(self, batch):
         return self.RE_model(batch)
@@ -45,7 +48,7 @@ class PlModel(pl.LightningModule):
                                  "interval": 'step'}}
 
     def training_step(self, batch, batch_idx):
-        ner_loss, ner_result, re_result = self.RE_model(batch)
+        ner_loss, _, _ = self.RE_model(batch)
         self.loss_list.append(float(ner_loss))
 
         cur_loss = round(sum(self.loss_list) / len(self.loss_list), 5)
@@ -56,38 +59,63 @@ class PlModel(pl.LightningModule):
 
     def training_epoch_end(self, outputs):
         self.loss_list.clear()
-        self.ner_f1.clear()
 
     def validation_step(self, batch, batch_idx):
         ner_loss, ner_result, re_result = self.RE_model(batch, is_test=True)
-        f1_recall_precision = compute_score(ner_result, batch)
-        return f1_recall_precision
+        true_recall_pred = compute_score(batch, ner_result, re_result)
+        return true_recall_pred
 
     def validation_epoch_end(self, validation_step_outputs):
-        f1 = round(sum(x[0] for x in validation_step_outputs) / len(validation_step_outputs), 5)
-        recall = round(sum(x[1] for x in validation_step_outputs) / len(validation_step_outputs), 5)
-        precision = round(sum(x[2] for x in validation_step_outputs) / len(validation_step_outputs), 5)
-        log_info = dict(f1=f1, recall=recall, precision=precision)
+        ner_true = sum(x[0] for x in validation_step_outputs)
+        ner_recall = sum(x[1] for x in validation_step_outputs)
+        ner_pred = sum(x[2] for x in validation_step_outputs)
+        re_true = sum(x[3] for x in validation_step_outputs)
+        re_recall = sum(x[4] for x in validation_step_outputs)
+        re_pred = sum(x[5] for x in validation_step_outputs)
+
+        ner_recall = ner_true / (ner_recall + 1e-20)
+        ner_precision = ner_true / (ner_pred + 1e-20)
+        ner_f1 = 2 * ner_recall * ner_precision / (ner_recall + ner_precision + 1e-20)
+
+        re_recall = re_true / (re_recall + 1e-20)
+        re_precision = re_true / (re_pred + 1e-20)
+        re_f1 = 2 * re_recall * re_precision / (re_recall + re_precision + 1e-20)
+
+        log_info = dict(ner_f1=ner_f1, ner_recall=ner_recall, ner_precision=ner_precision,
+                        re_f1=re_f1, re_recall=re_recall, re_precision=re_precision)
         self.log_dict(log_info)
+
+    def test_step(self, batch, batch_idx):
+        ner_loss, ner_result, re_result = self.RE_model(batch, is_test=True)
+        return get_result(ner_result, re_result, batch)
+
+    def test_epoch_end(self, outputs):
+        res = [x for batch in outputs for x in batch]
+        with open(self.save_name + '_result.json', 'w') as f:
+            for r in res:
+                f.write(json.dumps(r, ensure_ascii=False))
+                f.write('\n')
 
 
 def main(args):
     # ========================================== 检查参数 ==========================================
+    seed_everything(args.seed)
     if not torch.cuda.is_available():
         args.accelerator = 'cpu'
 
     # ========================================== 获取数据 ==========================================
     data_process(args)
     data = Data(args.data_path)
+    test_data = Data(args.test_data_path)
     train_len = int(0.8 * len(data))
     train_data, val_data = data[:train_len], data[train_len:]
 
     num_workers = 4 if args.accelerator == 'gpu' and platform.system() == 'Linux' else 0
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_batch,
                               num_workers=num_workers)
-    val_loader = DataLoader(val_data, batch_size=2, collate_fn=partial(get_batch, is_test=True),
+    val_loader = DataLoader(val_data, batch_size=4, collate_fn=get_batch,
                             num_workers=num_workers)
-
+    test_loader = DataLoader(test_data, batch_size=4, collate_fn=get_batch, num_workers=num_workers)
     # ========================================== 配置参数 ==========================================
     total_step = (len(train_loader) * args.max_epochs)
     strategy = None
@@ -100,10 +128,25 @@ def main(args):
 
     logger = MyLogger(args)
     model = PlModel(args, total_step)
-    trainer = pl.Trainer.from_argparse_args(args=args, strategy=strategy, logger=logger, num_sanity_val_steps=0)
+
+    callbacks = []
+    if args.enable_checkpointing:
+        checkpoint_callback = ModelCheckpoint(save_top_k=2,
+                                              monitor="re_f1",
+                                              mode="max",
+                                              dirpath='checkpoint',
+                                              filename=args.save_name + '--{epoch}--{re_f1:.4f}',
+                                              save_weights_only=True,
+                                              auto_insert_metric_name=True)
+        callbacks.append(checkpoint_callback)
+
+    trainer = pl.Trainer.from_argparse_args(args=args, strategy=strategy, logger=logger,
+                                            num_sanity_val_steps=0, callbacks=callbacks)
 
     # ========================================== 开始训练 ==========================================
-    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    # trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    model = model.load_from_checkpoint(r'checkpoint/Roberta_base--epoch=30--re_f1=0.6637.ckpt')
+    trainer.test(model=model, dataloaders=test_loader)
 
 
 if __name__ == "__main__":
@@ -111,11 +154,11 @@ if __name__ == "__main__":
     bert_name: [hfl/chinese-roberta-wwm-ext, nghuyong/ernie-3.0-base-zh]
     """
     parser = argparse.ArgumentParser()
-    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--seed", type=int, default=6)
     parser.add_argument("--accelerator", type=str, default='gpu')
     parser.add_argument("--accumulate_grad_batches", type=int, default=1)
     parser.add_argument("--devices", type=int, nargs='+', default=[0])
-    parser.add_argument("--max_epochs", type=int, default=20)
+    parser.add_argument("--max_epochs", type=int, default=30)
     parser.add_argument("--precision", type=int, default=16)
     parser.add_argument("--log_every_n_steps", type=int, default=100)
     parser.add_argument("--enable_checkpointing", action='store_true')
@@ -123,8 +166,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_clip_val", type=int, default=1)
 
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--bert_lr", type=float, default=1e-5)
-    parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument("--bert_lr", type=float, default=2e-5)
+    parser.add_argument("--lr", type=float, default=5e-4)
     parser.add_argument("--warm_ratio", type=float, default=0.06)
     parser.add_argument("--bert_path", type=str, default="hfl/chinese-roberta-wwm-ext")
     parser.add_argument("--new_token_num", type=int, default=0)
@@ -137,6 +180,8 @@ if __name__ == "__main__":
 
     parser.add_argument("--raw_data_path", type=str, default='../BDCI_data/train.json')
     parser.add_argument("--data_path", type=str, default='data/raw.bin')
+    parser.add_argument("--raw_test_data", type=str, default='../BDCI_data/evalA.json')
+    parser.add_argument("--test_data_path", type=str, default='data/test.bin')
 
     train_args = parser.parse_args()
     main(train_args)
