@@ -138,7 +138,7 @@ class BiLSTM(nn.Module):
                             batch_first=True, bidirectional=True)
         self.in_dropout = nn.Dropout(dropout)
 
-    def forward(self, src, src_lengths, pad_value=0):
+    def forward(self, src, src_lengths, h_0=None, pad_value=0):
         """
         src: [batch_size, len, input_size]
         src_lengths: [batch_size]
@@ -146,7 +146,11 @@ class BiLSTM(nn.Module):
         src = self.in_dropout(src)
         packed_src = nn.utils.rnn.pack_padded_sequence(src, src_lengths.cpu(), batch_first=True,
                                                        enforce_sorted=False)
-        packed_outputs, _ = self.lstm(packed_src)
+        if h_0 is not None:
+            h_0 = h_0.repeat(2, 1, 1)
+            packed_outputs, _ = self.lstm(packed_src, (h_0, torch.zeros_like(h_0, device=h_0.device)))
+        else:
+            packed_outputs, _ = self.lstm(packed_src)
         outputs, _ = nn.utils.rnn.pad_packed_sequence(packed_outputs, batch_first=True, padding_value=pad_value)
         return outputs
 
@@ -163,22 +167,6 @@ class GLU(nn.Module):
         v = self.v_dense(src)
         uv = F.sigmoid(u) * v
         return self.o_dense(uv)
-
-
-class FFNN(nn.Module):
-    def __init__(self, in_feature, out_feature, mid_size=256, dropout=0.2):
-        super(FFNN, self).__init__()
-        self.dense0 = nn.Linear(in_feature, mid_size)
-        self.dense1 = nn.Linear(mid_size, out_feature)
-        self.drop = nn.Dropout(dropout)
-
-    def forward(self, src):
-        output = self.dense0(src)
-        output = F.relu(output)
-        output = self.drop(output)
-        output = self.dense1(output)
-
-        return output
 
 
 class GroupLinear(nn.Module):
@@ -204,8 +192,12 @@ class NER(nn.Module):
         super(NER, self).__init__()
         self.start_fc = GLU(hidden_size, args.tag_size)
 
-        self.q_fc = nn.Linear(hidden_size, hidden_size)
-        self.k_fc = nn.Linear(hidden_size, hidden_size)
+        # self.q_fc = nn.Linear(hidden_size, hidden_size)
+        # self.k_fc = nn.Linear(hidden_size, hidden_size)
+        # self.q_fc = GLU(hidden_size, hidden_size)
+        # self.k_fc = GLU(hidden_size, hidden_size)
+        self.BiLSTM = BiLSTM(hidden_size, hidden_size)
+        self.end_fc = GLU(hidden_size * 2, 1)
         self.heads = 12
         self.scale = (hidden_size // 12) ** 0.5
 
@@ -233,24 +225,34 @@ class NER(nn.Module):
             entity_index = torch.nonzero(entity_index)
             entity = hidden_state[entity_index[:, 0], entity_index[:, 1]]
             entity = torch.split(entity, entity_num, dim=0)
-            entity = pad_sequence(entity, batch_first=True)
         else:
+            entity_mask = batch['entity_mask']
             entity_index = None
             entity_num = [len(batch['entity_start'][i]) for i in range(hidden_state.shape[0])]
             entity = []
             for i, x in enumerate(batch['entity_start']):
                 entity.append(hidden_state[i][x])
-            entity = pad_sequence(entity, batch_first=True)
 
-        q = self.q_fc(entity)
-        q = q.reshape(q.shape[0], q.shape[1], self.heads, -1)
-        q = q.permute(0, 2, 1, 3)
+        # entity = pad_sequence(entity, batch_first=True)
+        # q = self.q_fc(entity)
+        # q = q.reshape(q.shape[0], q.shape[1], self.heads, -1)
+        # q = q.permute(0, 2, 1, 3)
+        #
+        # k = self.k_fc(hidden_state)
+        # k = k.reshape(k.shape[0], k.shape[1], self.heads, -1)
+        # k = k.permute(0, 2, 3, 1)
+        #
+        # end_logit = (q @ k).mean(dim=1) / self.scale
 
-        k = self.k_fc(hidden_state)
-        k = k.reshape(k.shape[0], k.shape[1], self.heads, -1)
-        k = k.permute(0, 2, 3, 1)
+        # 用lstm
+        entity = torch.cat(entity, dim=0)
+        context_index = entity_mask.nonzero()[:, 0]
+        context = hidden_state[context_index]
+        context_len = batch['attention_mask'].sum(-1)[context_index]
+        end_logit = self.BiLSTM(context, context_len, entity.unsqueeze(0))
+        end_logit = self.end_fc(end_logit).squeeze(-1)
+        end_logit = pad_sequence(torch.split(end_logit, entity_num, dim=0), batch_first=True)
 
-        end_logit = (q @ k).mean(dim=1) / self.scale
         end_logit = end_logit.masked_fill(~(attention_mask.unsqueeze(1)), -5e4)
         if is_test:
             loss = None
@@ -281,51 +283,26 @@ class NER(nn.Module):
         return loss, (entity_start_index, entity_end_index)
 
 
-# class NER(nn.Module):
-#     def __init__(self, hidden_size, args):
-#         super(NER, self).__init__()
-#         self.glu = GLU(hidden_size * 2 + args.ner_emb_dim, args.tag_size)
-#         self.dropout = nn.Dropout(p=args.ner_dropout)
-#         # self.dense = nn.Linear(hidden_size * 2 + args.ner_emb_dim, args.tag_size)
-#         # self.dense = nn.Bilinear(hidden_size + args.ner_emb_dim, hidden_size + args.ner_emb_dim, args.tag_size)
-#         # self.FFNN = FFNN(hidden_size * 2 + args.ner_emb_dim, args.tag_size)
-#         self.span_emb = nn.Embedding(num_embeddings=args.span, embedding_dim=args.ner_emb_dim)
-#         self.loss_fn = CELoss()
-#
-#     def forward(self, hidden_state, batch):
-#         batch_size = hidden_state.shape[0]
-#         entity_heads = batch['entity_heads']
-#         entity_tails = batch['entity_tails']
-#         spans = self.span_emb(batch['spans'])
-#         entity_head_feature = torch.stack([hidden_state[i, entity_heads[i], :] for i in range(batch_size)], dim=0)
-#         entity_tail_feature = torch.stack([hidden_state[i, entity_tails[i], :] for i in range(batch_size)], dim=0)
-#         # 方案1：拼接头尾token特征, 再用glu分类
-#         entity_feature = self.dropout(torch.cat((entity_head_feature, entity_tail_feature), dim=-1))
-#         entity_feature = torch.cat((entity_feature, spans), dim=-1)
-#         entity_feature = self.glu(entity_feature)
-#
-#         # 方案2：头尾实体分别拼接span特征，在用bilinear分类
-#         # entity_head_feature = torch.cat((entity_head_feature, spans), dim=-1)
-#         # entity_tail_feature = torch.cat((entity_tail_feature, spans), dim=-1)
-#         # entity_feature = self.dense(entity_head_feature, entity_tail_feature)
-#
-#         # 方案3：头尾实体分别拼接span特征，再用前馈神经网络分类
-#         # entity_feature = torch.cat((entity_head_feature, entity_tail_feature, spans), dim=-1)
-#         # entity_feature = self.FFNN(entity_feature)
-#
-#         if 'entity_labels' in batch:
-#             loss = self.loss_fn(entity_feature, batch['entity_labels'])
-#             return loss, self.loss_fn.get_label(entity_feature)
-#         else:
-#             return None, self.loss_fn.get_label(entity_feature)
-
 class ExtraRelation(nn.Module):
     def __init__(self, hidden_size, args: argparse.Namespace):
         super(ExtraRelation, self).__init__()
-        self.h_dense = nn.Linear(hidden_size * 2, hidden_size)
-        self.t_dense = nn.Linear(hidden_size * 2, hidden_size)
+        # self.h_dense = nn.Linear(hidden_size * 2 + args.dis_emb, hidden_size)
+        # self.t_dense = nn.Linear(hidden_size * 2 + args.dis_emb, hidden_size)
+        self.h_dense = GLU(hidden_size * 2 + args.dis_emb, hidden_size)
+        self.t_dense = GLU(hidden_size * 2 + args.dis_emb, hidden_size)
         self.cls = GroupLinear(hidden_size, args.relation_num)
+        self.dis_emb = nn.Embedding(10, args.dis_emb)
         self.loss_fn = CELoss()
+        self.distance = torch.zeros(1024, dtype=torch.long)
+        self.distance[2:] = 1
+        self.distance[4:] = 2
+        self.distance[8:] = 3
+        self.distance[16:] = 4
+        self.distance[32:] = 5
+        self.distance[64:] = 6
+        self.distance[128:] = 7
+        self.distance[256:] = 8
+        self.distance[512:] = 9
 
     def forward(self, hidden_state, attention, ner_result, batch, is_test=False):
         batch_size = hidden_state.shape[0]
@@ -343,22 +320,20 @@ class ExtraRelation(nn.Module):
             entity_attention = (attention[i][head[i]] + attention[i][tail[i]]) * 0.5
 
             if entity_num[i] < 2:
-                # all_h.append(torch.zeros((1, hidden_state.shape[-1] * 2), device=hidden_state.device))
-                # all_t.append(torch.zeros((1, hidden_state.shape[-1] * 2), device=hidden_state.device))
                 continue
-            else:
-                hts = torch.tensor(list(permutations(range(entity_num[i]), 2)),
-                                   dtype=torch.int64, device=attention.device)
-                head_feature, tail_feature = entity_feature[hts[:, 0]], entity_feature[hts[:, 1]]
-                ht_attention = entity_attention[hts[:, 0]] * entity_attention[hts[:, 1]] * batch['attention_mask'][i]
-                ht_attention = ht_attention / (torch.sum(ht_attention, dim=-1, keepdim=True) + 1e-20)
-                ht_info = ht_attention @ hidden_state[i]
+            hts = torch.tensor(list(permutations(range(entity_num[i]), 2)),
+                               dtype=torch.int64, device=attention.device)
+            head_feature, tail_feature = entity_feature[hts[:, 0]], entity_feature[hts[:, 1]]
+            ht_attention = entity_attention[hts[:, 0]] * entity_attention[hts[:, 1]] * batch['attention_mask'][i]
+            ht_attention = ht_attention / (torch.sum(ht_attention, dim=-1, keepdim=True) + 1e-20)
+            ht_info = ht_attention @ hidden_state[i]
 
-                all_h.append(torch.cat((head_feature, ht_info), dim=-1))
-                all_t.append(torch.cat((tail_feature, ht_info), dim=-1))
+            ht_distance = torch.abs(head[i][hts[:, 0]] - head[i][hts[:, 1]])
+            ht_distance = self.distance[ht_distance].to(hidden_state).long()
+            ht_distance = self.dis_emb(ht_distance)
+            all_h.append(torch.cat((head_feature, ht_info, ht_distance), dim=-1))
+            all_t.append(torch.cat((tail_feature, ht_info, -ht_distance), dim=-1))
 
-        # all_h = torch.tanh(self.h_dense(pad_sequence(all_h, batch_first=True)))
-        # all_t = torch.tanh(self.t_dense(pad_sequence(all_t, batch_first=True)))
         if is_test and not all_h:
             return None, [torch.tensor([]) for _ in range(batch_size)]
         all_h = torch.tanh(self.h_dense(torch.cat(all_h, dim=0)))
@@ -368,9 +343,6 @@ class ExtraRelation(nn.Module):
         if is_test:
             loss = None
         else:
-            # mask = torch.zeros_like(batch['relations'], device=hidden_state.device, dtype=torch.bool)
-            # for i in range(batch_size):
-            #     mask[i, :pair_num[i]] = True
             mask = None
             loss = self.loss_fn(pred, batch['relations'], mask)
         pred = torch.argmax(pred, dim=-1)

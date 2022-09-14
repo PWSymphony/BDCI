@@ -113,9 +113,9 @@ def main(args):
     num_workers = 4 if args.accelerator == 'gpu' and platform.system() == 'Linux' else 0
     train_loader = DataLoader(train_data, batch_size=args.batch_size, shuffle=True, collate_fn=get_batch,
                               num_workers=num_workers)
-    val_loader = DataLoader(val_data, batch_size=4, collate_fn=get_batch,
+    val_loader = DataLoader(val_data, batch_size=6, collate_fn=get_batch,
                             num_workers=num_workers)
-    test_loader = DataLoader(test_data, batch_size=4, collate_fn=get_batch, num_workers=num_workers)
+    test_loader = DataLoader(test_data, batch_size=6, collate_fn=get_batch, num_workers=num_workers)
     # ========================================== 配置参数 ==========================================
     total_step = (len(train_loader) * args.max_epochs)
     strategy = None
@@ -144,9 +144,9 @@ def main(args):
                                             num_sanity_val_steps=0, callbacks=callbacks)
 
     # ========================================== 开始训练 ==========================================
-    # trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
-    model = model.load_from_checkpoint(r'checkpoint/Roberta_base--epoch=30--re_f1=0.6637.ckpt')
-    trainer.test(model=model, dataloaders=test_loader)
+    trainer.fit(model=model, train_dataloaders=train_loader, val_dataloaders=val_loader)
+    # model = model.load_from_checkpoint(r'checkpoint/Roberta_base--epoch=30--re_f1=0.6637.ckpt')
+    # trainer.test(model=model, dataloaders=test_loader)
 
 
 if __name__ == "__main__":
@@ -175,6 +175,7 @@ if __name__ == "__main__":
     parser.add_argument("--print_log", action='store_true')
 
     parser.add_argument("--max_len", type=int, default=1024)
+    parser.add_argument("--dis_emb", type=int, default=32)
     parser.add_argument("--tag_size", type=int, default=6)
     parser.add_argument("--relation_num", type=int, default=5)
 
