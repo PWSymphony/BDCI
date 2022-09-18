@@ -5,10 +5,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.nn.utils.rnn import pad_sequence
 from transformers import BertModel
 
-from loss import CELoss
+from loss import CELoss, focal_loss
 
 
 def process_long_input(model, input_ids, attention_mask, start_tokens, end_tokens):
@@ -21,9 +20,7 @@ def process_long_input(model, input_ids, attention_mask, start_tokens, end_token
     len_start = start_tokens.size(0)
     len_end = end_tokens.size(0)
     if c <= 512:
-        output = model(input_ids=input_ids,
-                       attention_mask=attention_mask,
-                       output_attentions=True)
+        output = model(input_ids=input_ids, attention_mask=attention_mask, output_attentions=True)
         sequence_output = output[0]
         attention = output[-1][-1]
     else:
@@ -112,7 +109,7 @@ def compute_score(batch, ner_result, re_result):
                 re_pred.append((h[0], h[1], t[0], t[1], cur_re_result[j]))
         re_pred_num += len(re_pred)
 
-        ner_true = torch.stack((true_start, batch['entity_end'][i, :true_e_num])).permute(1, 0).tolist()
+        ner_true = torch.stack((true_start, batch['entity_end'][i][:true_e_num])).permute(1, 0).tolist()
         ner_true = [tuple(x) for x in ner_true]
 
         j = -1
@@ -156,11 +153,11 @@ class BiLSTM(nn.Module):
 
 
 class GLU(nn.Module):
-    def __init__(self, in_feature, out_feature):
+    def __init__(self, in_feature, out_feature, n=1):
         super(GLU, self).__init__()
-        self.u_dense = nn.Linear(in_feature, 3 * in_feature)
-        self.v_dense = nn.Linear(in_feature, 3 * in_feature)
-        self.o_dense = nn.Linear(3 * in_feature, out_feature)
+        self.u_dense = nn.Linear(in_feature, n * in_feature)
+        self.v_dense = nn.Linear(in_feature, n * in_feature)
+        self.o_dense = nn.Linear(n * in_feature, out_feature)
 
     def forward(self, src):
         u = self.u_dense(src)
@@ -187,111 +184,188 @@ class GroupLinear(nn.Module):
         return self.linear(output)
 
 
+# class NER(nn.Module):
+#     def __init__(self, hidden_size, args):
+#         super(NER, self).__init__()
+#         self.start_fc = GLU(hidden_size, args.tag_size, n=2)
+#
+#         # === 点积 ===
+#         self.q_fc = nn.Linear(hidden_size, hidden_size)
+#         self.k_fc = nn.Linear(hidden_size, hidden_size)
+#         self.q_fc = GLU(hidden_size, hidden_size)
+#         self.k_fc = GLU(hidden_size, hidden_size)
+#
+#         # ==== LSTM ====
+#         # self.BiLSTM = BiLSTM(hidden_size, hidden_size)
+#         # self.end_fc = GLU(hidden_size * 2, 1, n=1)
+#
+#         # === 双仿射 ===
+#         # self.bi_affine = nn.Bilinear(hidden_size, hidden_size, 1)
+#         # self.W = nn.Linear(hidden_size, 1)
+#
+#         self.heads = 12 if hidden_size == 768 else 16
+#         self.scale = (hidden_size // 12) ** 0.5
+#
+#         self.loss_fn = CELoss()
+#
+#     def forward(self, hidden_state, batch, is_test=False):
+#         batch_size = hidden_state.shape[0]
+#         attention_mask = batch['attention_mask']
+#         start_logit = self.start_fc(hidden_state)
+#
+#         if is_test:
+#             entity_index_map = torch.argmax(start_logit, dim=-1) * batch['attention_mask']
+#             text_len = batch['attention_mask'].sum(-1) - 1
+#             # 将 [CLS] 和 [SEP] 变为 0
+#             entity_index_map[:, 0] = 0
+#             for i in range(batch_size):
+#                 entity_index_map[i, text_len[i]] = 0
+#
+#             entity_num = entity_index_map.bool().sum(-1).tolist()
+#
+#             entity_mask = torch.zeros((hidden_state.shape[0], max(entity_num)), dtype=torch.bool,
+#                                       device=hidden_state.device)
+#
+#             for i in range(hidden_state.shape[0]):
+#                 entity_mask[i, :entity_num[i]] = True
+#
+#             entity_index = torch.nonzero(entity_index_map)
+#             entity = hidden_state[entity_index[:, 0], entity_index[:, 1]]
+#             entity = torch.split(entity, entity_num, dim=0)
+#             entity_type = torch.split(entity_index_map[entity_index[:, 0], entity_index[:, 1]], entity_num, dim=0)
+#         else:
+#             entity_mask = batch['entity_mask']
+#             entity_type = []
+#             entity_index = None
+#             entity_num = [len(batch['entity_start'][i]) for i in range(hidden_state.shape[0])]
+#             entity = []
+#             for i, x in enumerate(batch['entity_start']):
+#                 entity.append(hidden_state[i][x])
+#                 entity_type.append(batch['entity_target'][i][x])
+#
+#         # === 点积 ===
+#         entity = pad_sequence(entity, batch_first=True)
+#         q = self.q_fc(entity)
+#         q = q.reshape(q.shape[0], q.shape[1], self.heads, hidden_state.shape[-1] // self.heads)
+#         q = q.permute(0, 2, 1, 3)
+#
+#         k = self.k_fc(hidden_state)
+#         k = k.reshape(k.shape[0], k.shape[1], self.heads, hidden_state.shape[-1] // self.heads)
+#         k = k.permute(0, 2, 3, 1)
+#
+#         end_logit = (q @ k).mean(dim=1) / self.scale
+#
+#         # === LSTM ===
+#         # entity = torch.cat(entity, dim=0)
+#         # context_index = entity_mask.nonzero()[:, 0]
+#         # context = hidden_state[context_index]
+#         # context_len = batch['attention_mask'].sum(-1)[context_index]
+#         # end_logit = self.BiLSTM(context, context_len, entity.unsqueeze(0))
+#         # end_logit = self.end_fc(end_logit).squeeze(-1)
+#         # end_logit = pad_sequence(torch.split(end_logit, entity_num, dim=0), batch_first=True)
+#
+#         # === 双仿射 === 显存不够
+#         # entity = torch.cat(entity, dim=0).unsqueeze(1)
+#         # # entity = entity.repeat(1, hidden_state.shape[1], 1)
+#         # context_index = entity_mask.nonzero()[:, 0]
+#         # context = hidden_state[context_index]
+#         # end_logit = self.bi_affine(entity, context) + self.W(entity * context)
+#         # end_logit = end_logit.squeeze(-1)
+#         # end_logit = pad_sequence(torch.split(end_logit, entity_num, dim=0), batch_first=True)
+#
+#         end_logit = end_logit.masked_fill(~(attention_mask.bool().unsqueeze(1)), -5e4)
+#         if is_test:
+#             loss = None
+#             entity_start_index = torch.split(entity_index, entity_num, dim=0)
+#             entity_start_index = [x[:, 1] for x in entity_start_index]
+#
+#             entity_end_index = end_logit.max(-1)[1]
+#             entity_end_index = [entity_end_index[i, :entity_num[i]] for i in range(hidden_state.shape[0])]
+#             new_entity_start_index, new_end_start_index = [], []
+#             for i in range(batch_size):
+#                 delta = entity_end_index[i] - entity_start_index[i]
+#                 index = (0 <= delta) & (delta < 20)
+#                 new_entity_start_index.append(entity_start_index[i][index])
+#                 new_end_start_index.append(entity_end_index[i][index])
+#             entity_start_index = new_entity_start_index
+#             entity_end_index = new_end_start_index
+#         else:
+#             entity_target = batch['entity_target']
+#             entity_end = batch['entity_end']
+#
+#             loss1 = self.loss_fn(start_logit, entity_target, attention_mask)
+#             loss2 = self.loss_fn(end_logit, entity_end, batch['entity_mask'])
+#             loss = loss1 + loss2
+#             entity_start_index = batch['entity_start']
+#
+#             entity_end_index = [entity_end[i, :entity_num[i]] for i in range(hidden_state.shape[0])]
+#
+#         return loss, (entity_start_index, entity_end_index, entity_type)
 class NER(nn.Module):
     def __init__(self, hidden_size, args):
         super(NER, self).__init__()
-        self.start_fc = GLU(hidden_size, args.tag_size)
 
-        # self.q_fc = nn.Linear(hidden_size, hidden_size)
-        # self.k_fc = nn.Linear(hidden_size, hidden_size)
-        # self.q_fc = GLU(hidden_size, hidden_size)
-        # self.k_fc = GLU(hidden_size, hidden_size)
-        self.BiLSTM = BiLSTM(hidden_size, hidden_size)
-        self.end_fc = GLU(hidden_size * 2, 1)
-        self.heads = 12
-        self.scale = (hidden_size // 12) ** 0.5
+        self.tag_size = args.tag_size
+        self.q_dense = nn.Linear(hidden_size, hidden_size * args.tag_size)
+        self.k_dense = nn.Linear(hidden_size, hidden_size * args.tag_size)
+        # self.q_dense = GLU(hidden_size, hidden_size * args.tag_size)
+        # self.k_dense = GLU(hidden_size, hidden_size * args.tag_size)
+
+        self.heads = 12 if hidden_size == 768 else 16
+        self.scale = (hidden_size // 12) ** -0.5
 
         self.loss_fn = CELoss()
 
     def forward(self, hidden_state, batch, is_test=False):
-        batch_size = hidden_state.shape[0]
-        attention_mask = batch['attention_mask']
-        start_logit = self.start_fc(hidden_state)
+        batch_size, max_len, _ = hidden_state.shape
+        attention = batch['attention_mask']
 
-        if is_test:
-            entity_index = torch.argmax(start_logit, dim=-1) * batch['attention_mask']
-            text_len = batch['attention_mask'].sum(-1) - 1
-            entity_index[:, 0] = 0
-            for i in range(batch_size):
-                entity_index[i, text_len[i]] = 0
-            entity_num = entity_index.bool().sum(-1).tolist()
-
-            entity_mask = torch.zeros((hidden_state.shape[0], max(entity_num)), dtype=torch.bool,
-                                      device=hidden_state.device)
-
-            for i in range(hidden_state.shape[0]):
-                entity_mask[i, :entity_num[i]] = True
-
-            entity_index = torch.nonzero(entity_index)
-            entity = hidden_state[entity_index[:, 0], entity_index[:, 1]]
-            entity = torch.split(entity, entity_num, dim=0)
-        else:
-            entity_mask = batch['entity_mask']
-            entity_index = None
-            entity_num = [len(batch['entity_start'][i]) for i in range(hidden_state.shape[0])]
-            entity = []
-            for i, x in enumerate(batch['entity_start']):
-                entity.append(hidden_state[i][x])
-
-        # entity = pad_sequence(entity, batch_first=True)
-        # q = self.q_fc(entity)
-        # q = q.reshape(q.shape[0], q.shape[1], self.heads, -1)
-        # q = q.permute(0, 2, 1, 3)
-        #
-        # k = self.k_fc(hidden_state)
-        # k = k.reshape(k.shape[0], k.shape[1], self.heads, -1)
-        # k = k.permute(0, 2, 3, 1)
-        #
-        # end_logit = (q @ k).mean(dim=1) / self.scale
-
-        # 用lstm
-        entity = torch.cat(entity, dim=0)
-        context_index = entity_mask.nonzero()[:, 0]
-        context = hidden_state[context_index]
-        context_len = batch['attention_mask'].sum(-1)[context_index]
-        end_logit = self.BiLSTM(context, context_len, entity.unsqueeze(0))
-        end_logit = self.end_fc(end_logit).squeeze(-1)
-        end_logit = pad_sequence(torch.split(end_logit, entity_num, dim=0), batch_first=True)
-
-        end_logit = end_logit.masked_fill(~(attention_mask.unsqueeze(1)), -5e4)
+        q = self.q_dense(hidden_state).reshape(batch_size, max_len, self.tag_size, self.heads, -1)
+        k = self.k_dense(hidden_state).reshape(batch_size, max_len, self.tag_size, self.heads, -1)
+        q = q.permute(0, 2, 3, 1, 4)
+        k = k.permute(0, 2, 3, 4, 1)
+        score = (q @ k) * self.scale  # (batch_size, tag_size, head, max_len, max_len)
+        score = score.permute(0, 3, 4, 1, 2)  # (batch_size, max_len, max_len, tag_size, head)
+        # score = torch.logsumexp(score, dim=-1)  # (batch_size, max_len, max_len, tag_size)
+        score = torch.mean(score, dim=-1)  # (batch_size, max_len, max_len, tag_size)
         if is_test:
             loss = None
-            entity_start_index = torch.split(entity_index, entity_num, dim=0)
-            entity_start_index = [x[:, 1] for x in entity_start_index]
-
-            entity_end_index = end_logit.max(-1)[1]
-            entity_end_index = [entity_end_index[i, :entity_num[i]] for i in range(hidden_state.shape[0])]
-            new_entity_start_index, new_end_start_index = [], []
+            entity_start_index, entity_end_index, entity_type = [], [], []
+            score = score * batch['span_mask'].unsqueeze(-1)
             for i in range(batch_size):
-                delta = entity_end_index[i] - entity_start_index[i]
-                index = (0 <= delta) & (delta < 20)
-                new_entity_start_index.append(entity_start_index[i][index])
-                new_end_start_index.append(entity_end_index[i][index])
-            entity_start_index = new_entity_start_index
-            entity_end_index = new_end_start_index
+                cur_score = torch.argmax(score[i], dim=-1)
+                entity_index = cur_score.nonzero()
+                start, end = entity_index[:, 0], entity_index[:, 1]
+                cur_entity_type = cur_score[start, end]
+                if start.shape[0] > 100:
+                    top_index = torch.topk(score[i][start, end, cur_entity_type], k=200)[1]
+                    start, end, cur_entity_type = start[top_index], end[top_index], cur_entity_type[top_index]
+                entity_start_index.append(start)
+                entity_end_index.append(end)
+                entity_type.append(cur_entity_type)
         else:
-            entity_target = batch['entity_target']
-            entity_end = batch['entity_end']
+            score = torch.masked_fill(score, batch['span_mask'].unsqueeze(-1), -5e4)
+            loss = self.loss_fn(score, batch['span_target'], batch['span_mask'])
+            entity_start_index, entity_end_index, entity_type = \
+                batch['entity_start'], batch['entity_end'], batch['entity_type']
 
-            loss1 = self.loss_fn(start_logit, entity_target, attention_mask)
-            loss2 = self.loss_fn(end_logit, entity_end, batch['entity_mask'])
-            loss = loss1 + loss2
-            entity_start_index = batch['entity_start']
-
-            entity_end_index = [entity_end[i, :entity_num[i]] for i in range(hidden_state.shape[0])]
-
-        return loss, (entity_start_index, entity_end_index)
+        return loss, (entity_start_index, entity_end_index, entity_type)
 
 
 class ExtraRelation(nn.Module):
     def __init__(self, hidden_size, args: argparse.Namespace):
         super(ExtraRelation, self).__init__()
-        # self.h_dense = nn.Linear(hidden_size * 2 + args.dis_emb, hidden_size)
-        # self.t_dense = nn.Linear(hidden_size * 2 + args.dis_emb, hidden_size)
-        self.h_dense = GLU(hidden_size * 2 + args.dis_emb, hidden_size)
-        self.t_dense = GLU(hidden_size * 2 + args.dis_emb, hidden_size)
+        self.h_dense = nn.Linear(hidden_size * 2, hidden_size)
+        self.t_dense = nn.Linear(hidden_size * 2, hidden_size)
+        # self.h_dense = GLU(hidden_size * 2, hidden_size)
+        # self.t_dense = GLU(hidden_size * 2, hidden_size)
+
+        self.dis_emb = nn.Embedding(20, args.dis_emb)
+        self.type_emb = nn.Embedding(6, args.type_emb)
+
         self.cls = GroupLinear(hidden_size, args.relation_num)
-        self.dis_emb = nn.Embedding(10, args.dis_emb)
+        self.cls1 = GroupLinear(args.dis_emb + args.type_emb, args.relation_num)
+
         self.loss_fn = CELoss()
         self.distance = torch.zeros(1024, dtype=torch.long)
         self.distance[2:] = 1
@@ -306,8 +380,8 @@ class ExtraRelation(nn.Module):
 
     def forward(self, hidden_state, attention, ner_result, batch, is_test=False):
         batch_size = hidden_state.shape[0]
-        attention = attention.mean(dim=1)
-        head, tail = ner_result
+        attention = attention.sum(dim=1)
+        head, tail, entity_type = ner_result
         if is_test:
             entity_num = [len(x) for x in head]
         else:
@@ -315,15 +389,18 @@ class ExtraRelation(nn.Module):
         pair_num = [x * (x - 1) for x in entity_num]
 
         all_h, all_t = [], []
+        h_type_dis, t_type_dis = [], []
         for i in range(batch_size):
             entity_feature = (hidden_state[i][head[i]] + hidden_state[i][tail[i]]) * 0.5
             entity_attention = (attention[i][head[i]] + attention[i][tail[i]]) * 0.5
+            entity_type_feature = self.type_emb(entity_type[i])
 
             if entity_num[i] < 2:
                 continue
             hts = torch.tensor(list(permutations(range(entity_num[i]), 2)),
                                dtype=torch.int64, device=attention.device)
             head_feature, tail_feature = entity_feature[hts[:, 0]], entity_feature[hts[:, 1]]
+            head_type, tail_type = entity_type_feature[hts[:, 0]], entity_type_feature[hts[:, 1]]
             ht_attention = entity_attention[hts[:, 0]] * entity_attention[hts[:, 1]] * batch['attention_mask'][i]
             ht_attention = ht_attention / (torch.sum(ht_attention, dim=-1, keepdim=True) + 1e-20)
             ht_info = ht_attention @ hidden_state[i]
@@ -331,14 +408,21 @@ class ExtraRelation(nn.Module):
             ht_distance = torch.abs(head[i][hts[:, 0]] - head[i][hts[:, 1]])
             ht_distance = self.distance[ht_distance].to(hidden_state).long()
             ht_distance = self.dis_emb(ht_distance)
-            all_h.append(torch.cat((head_feature, ht_info, ht_distance), dim=-1))
-            all_t.append(torch.cat((tail_feature, ht_info, -ht_distance), dim=-1))
+
+            all_h.append(torch.cat((head_feature, ht_info), dim=-1))
+            all_t.append(torch.cat((tail_feature, ht_info), dim=-1))
+            h_type_dis.append(torch.cat((head_type, ht_distance), dim=-1))
+            t_type_dis.append(torch.cat((tail_type, ht_distance), dim=-1))
 
         if is_test and not all_h:
             return None, [torch.tensor([]) for _ in range(batch_size)]
+        h_type_dis = torch.cat(h_type_dis, dim=0)
+        t_type_dis = torch.cat(t_type_dis, dim=0)
+
         all_h = torch.tanh(self.h_dense(torch.cat(all_h, dim=0)))
         all_t = torch.tanh(self.t_dense(torch.cat(all_t, dim=0)))
-        pred = self.cls(all_h, all_t)
+
+        pred = self.cls(all_h, all_t) + self.cls1(h_type_dis, t_type_dis)
 
         if is_test:
             loss = None

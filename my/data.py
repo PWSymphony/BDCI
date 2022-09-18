@@ -1,3 +1,4 @@
+
 import argparse
 import json
 import logging
@@ -8,22 +9,23 @@ from itertools import permutations
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 from pytorch_lightning.loggers import LightningLoggerBase
 from pytorch_lightning.utilities.distributed import rank_zero_only
 from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import Dataset
 from tqdm import tqdm
-from transformers import BertTokenizerFast, logging as transformer_log
+from transformers import logging as transformer_log, AutoTokenizer
 
 transformer_log.set_verbosity_error()
 warnings.filterwarnings("ignore", category=UserWarning)
 LABEL = {"部件故障": 1, "性能故障": 2, "检测工具": 3, "组成": 4}
 ID2LABEL = {v: k for k, v in LABEL.items()}
 TYPE = {"部件单元": 1, "性能表征": 2, "故障状态": 3, "检测工具": 4}
-LABEL2TYPE = {"部件故障": [TYPE["部件单元"], TYPE["故障状态"]],
-              "性能故障": [TYPE["性能表征"], TYPE["故障状态"]],
-              "检测工具": [TYPE["检测工具"], TYPE["性能表征"]],
-              "组成": [TYPE["部件单元"], TYPE["部件单元"]]}
+LABEL2TYPE = {"部件故障": (TYPE["部件单元"], TYPE["故障状态"]),
+              "性能故障": (TYPE["性能表征"], TYPE["故障状态"]),
+              "检测工具": (TYPE["检测工具"], TYPE["性能表征"]),
+              "组成": (TYPE["部件单元"], TYPE["部件单元"])}
 
 
 def get_offset(offset_mapping):
@@ -147,7 +149,7 @@ def data_process(args):
         d['text'] = d['text'].lower()
         all_token.update(d['text'].lower())
     all_token = list(all_token)
-    tokenizer = BertTokenizerFast.from_pretrained(args.bert_path)
+    tokenizer = AutoTokenizer.from_pretrained(args.bert_path)
     add_token_num = tokenizer.add_tokens(all_token)
     args.new_token_num = len(tokenizer)
     CLS_id = tokenizer.cls_token_id
@@ -156,6 +158,7 @@ def data_process(args):
     res = []
     not_same_entity = []
     max_entity_num = 0
+    # type_num = len(TYPE) + 1  # 有一种是非实体
     for item in tqdm(data):
         text = item['text']
         input_id = [CLS_id] + [tokenizer.convert_tokens_to_ids(i) for i in text] + [SEP_id]
@@ -163,6 +166,7 @@ def data_process(args):
         if len(input_id) > args.max_len:
             sep = input_id[-1]
             input_id = input_id[:1023] + [sep]
+        text_len = len(input_id)
 
         spo_list = item.get('spo_list', None)
         if not spo_list:
@@ -198,28 +202,40 @@ def data_process(args):
         entity.sort(key=lambda x: x[1])
 
         relations = np.asarray([spo_dict.get((h, t), 0) for h, t in permutations(entity, 2)])
+
         entity_num = len(entity)
-        entity_target = np.zeros((len(input_id)))
-        entity_start = np.zeros((len(entity)))
-        entity_end = np.zeros((len(entity)))
+        entity_target = np.zeros(text_len)
+        entity_start = np.zeros(entity_num)
+        entity_end = np.zeros(entity_num)
+
+        # 多头标注
+
+        span_target = np.zeros((text_len, text_len))
+        entity_type = np.zeros(entity_num)
         for i, e in enumerate(entity):
             # e: [start_pos, end_pos + 1, type_id]
             entity_target[e[0]] = e[2] if entity_target[e[0]] == 0 else 5
             entity_end[i] = e[1] - 1
             entity_start[i] = e[0]
 
+            span_target[e[0], e[1] - 1] = e[2]
+            entity_type[i] = e[2]
+
         res.append(dict(input_id=np.asarray(input_id),
                         entity_num=entity_num,
                         entity_target=entity_target,
                         entity_start=entity_start,
                         entity_end=entity_end,
-                        relations=relations))
-    with open(args.data_path, 'wb') as f:
-        pickle.dump(res, f)
-    process_test_data(args.raw_test_data, args.test_data_path, tokenizer, args.max_len)
+                        relations=relations,
+                        span_target=span_target,
+                        entity_type=entity_type))
+    # with open(args.data_path, 'wb') as f:
+    #     pickle.dump(res, f)
+    test_data = process_test_data(args.raw_test_data, args.test_data_path, tokenizer, args.max_len)
     print('可能不匹配的实体数量： ', len(not_same_entity))
     print('增加的token数量： ', add_token_num)
     print('最大实体数量', max_entity_num)
+    return res, test_data
 
 
 def process_test_data(raw_path, out_path, tokenizer, max_len):
@@ -239,8 +255,9 @@ def process_test_data(raw_path, out_path, tokenizer, max_len):
         res.append(dict(input_id=np.asarray(input_id),
                         ID=item['ID'],
                         text=item['text']))
-    with open(out_path, 'wb') as f:
-        pickle.dump(res, f)
+    # with open(out_path, 'wb') as f:
+    #     pickle.dump(res, f)
+    return res
 
 
 def get_result(ner_result, re_result, batch):
@@ -273,10 +290,11 @@ def get_result(ner_result, re_result, batch):
 
 
 class Data(Dataset):
-    def __init__(self, path):
+    def __init__(self, data):
         super(Data, self).__init__()
-        with open(path, 'rb') as f:
-            self.data = pickle.load(f)
+        # with open(path, 'rb') as f:
+        #     self.data = pickle.load(f)
+        self.data = data
 
     def __getitem__(self, item):
         return self.data[item]
@@ -289,7 +307,7 @@ def create_mask(batch, input_id):
     attention_mask = torch.zeros_like(input_id, dtype=torch.bool)
     for i, x in enumerate(batch):
         attention_mask[i, :len(x['input_id'])] = True
-    return attention_mask
+    return attention_mask.bool()
 
 
 def get_sample(batch, is_test):
@@ -327,6 +345,27 @@ def get_sample(batch, is_test):
     return entity_heads, entity_tails, entity_labels, spans
 
 
+SPAN_MASK = torch.ones((1024, 1024), dtype=torch.bool)
+for I in range(1024):
+    SPAN_MASK[I, :(I + 1)] = False
+
+
+def get_span_target(batch, max_len):
+    res = []
+    all_mask = []
+    for x in batch:
+        pad_len = max_len - len(x['input_id'])
+        target = torch.from_numpy(x['span_target'])
+        mask = SPAN_MASK[:len(x['input_id']), :len(x['input_id'])]
+        target = F.pad(target, (0, pad_len, 0, pad_len))
+        mask = F.pad(mask, (0, pad_len, 0, pad_len))
+        res.append(target)
+        all_mask.append(mask)
+    res = torch.stack(res, dim=0)
+    all_mask = torch.stack(all_mask, dim=0)
+    return res, all_mask
+
+
 def get_batch(batch):
     input_id = pad_sequence([torch.from_numpy(x["input_id"]) for x in batch], batch_first=True)
     attention_mask = create_mask(batch, input_id)
@@ -342,14 +381,20 @@ def get_batch(batch):
         # entity_heads, entity_tails, entity_labels, spans = get_sample(batch, is_test)
 
         entity_target = pad_sequence([torch.from_numpy(x['entity_target']) for x in batch], batch_first=True)
-        entity_end = pad_sequence([torch.from_numpy(x['entity_end']) for x in batch], batch_first=True)
+        # entity_end = pad_sequence([torch.from_numpy(x['entity_end']) for x in batch], batch_first=True)
+        entity_end = [torch.from_numpy(x['entity_end']).long() for x in batch]
         entity_start = [torch.from_numpy(x['entity_start']).long() for x in batch]
+        span_target, span_mask = get_span_target(batch, max_len)
+        entity_type = [torch.from_numpy(x['entity_type']).long() for x in batch]
 
         return dict(input_id=input_id,
                     entity_target=entity_target.long(),
+                    span_target=span_target.long(),
+                    span_mask=span_mask,
+                    entity_type=entity_type,
                     entity_start=entity_start,
-                    entity_end=entity_end.long(),
-                    attention_mask=attention_mask.bool(),
+                    entity_end=entity_end,
+                    attention_mask=attention_mask,
                     relations=relations.long(),
                     entity_mask=entity_mask.bool())
     else:
@@ -388,7 +433,7 @@ class MyLogger(LightningLoggerBase):
         logger.setLevel(logging.DEBUG)
         formatter = logging.Formatter('%(message)s')
 
-        fh = logging.FileHandler(args.save_name + '.txt')
+        fh = logging.FileHandler('log/' + args.save_name + '.txt')
         fh.setLevel(logging.DEBUG)
         fh.setFormatter(formatter)
         logger.addHandler(fh)

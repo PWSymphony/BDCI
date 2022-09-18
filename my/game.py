@@ -104,9 +104,9 @@ def main(args):
         args.accelerator = 'cpu'
 
     # ========================================== 获取数据 ==========================================
-    data_process(args)
-    data = Data(args.data_path)
-    test_data = Data(args.test_data_path)
+    train_data, test_data = data_process(args)
+    data = Data(train_data)
+    test_data = Data(test_data)
     train_len = int(0.8 * len(data))
     train_data, val_data = data[:train_len], data[train_len:]
 
@@ -166,8 +166,8 @@ if __name__ == "__main__":
     parser.add_argument("--gradient_clip_val", type=int, default=1)
 
     parser.add_argument("--batch_size", type=int, default=2)
-    parser.add_argument("--bert_lr", type=float, default=2e-5)
-    parser.add_argument("--lr", type=float, default=5e-4)
+    parser.add_argument("--bert_lr", type=float, default=3e-5)
+    parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--warm_ratio", type=float, default=0.06)
     parser.add_argument("--bert_path", type=str, default="hfl/chinese-roberta-wwm-ext")
     parser.add_argument("--new_token_num", type=int, default=0)
@@ -176,6 +176,7 @@ if __name__ == "__main__":
 
     parser.add_argument("--max_len", type=int, default=1024)
     parser.add_argument("--dis_emb", type=int, default=32)
+    parser.add_argument("--type_emb", type=int, default=32)
     parser.add_argument("--tag_size", type=int, default=6)
     parser.add_argument("--relation_num", type=int, default=5)
 
